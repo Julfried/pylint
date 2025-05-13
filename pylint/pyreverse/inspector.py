@@ -31,6 +31,7 @@ _WrapperFuncT = Callable[
 ]
 
 
+# Define typed dataclasses as node extensions, so that astroid nodes can be modified in a type-safe way.
 @dataclass
 class NodeExtension:
     """Extension for astroid nodes with typed attributes."""
