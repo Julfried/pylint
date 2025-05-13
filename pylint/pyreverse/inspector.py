@@ -13,10 +13,13 @@ import collections
 import os
 import traceback
 from abc import ABC, abstractmethod
+from collections import defaultdict
 from collections.abc import Callable, Sequence
-from typing import Optional
+from dataclasses import dataclass, field
+from typing import Any, Optional
 
 import astroid
+import astroid.exceptions
 from astroid import nodes
 
 from pylint import constants
@@ -26,6 +29,43 @@ from pylint.pyreverse import utils
 _WrapperFuncT = Callable[
     [Callable[[str], nodes.Module], str, bool], Optional[nodes.Module]
 ]
+
+
+@dataclass
+class NodeExtension:
+    """Extension for astroid nodes with typed attributes."""
+
+    locals_type: defaultdict[str, list[Any]] = field(
+        default_factory=lambda: defaultdict(list)
+    )
+
+
+@dataclass
+class ModuleExtension(NodeExtension):
+    """Extension for astroid.Module nodes."""
+
+    depends: list[str] = field(default_factory=list)
+    type_depends: list[str] = field(default_factory=list)
+
+
+@dataclass
+class ClassExtension(NodeExtension):
+    """Extension for astroid.ClassDef nodes."""
+
+    instance_attrs_type: defaultdict[str, list[Any]] = field(
+        default_factory=lambda: defaultdict(list)
+    )
+    aggregations_type: defaultdict[str, list[Any]] = field(
+        default_factory=lambda: defaultdict(list)
+    )
+    associations_type: defaultdict[str, list[Any]] = field(
+        default_factory=lambda: defaultdict(list)
+    )
+
+
+@dataclass
+class FunctionExtension(NodeExtension):
+    """Extension for astroid.FunctionDef nodes."""
 
 
 def _astroid_wrapper(
