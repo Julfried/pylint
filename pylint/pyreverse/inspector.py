@@ -15,7 +15,6 @@ import traceback
 from abc import ABC, abstractmethod
 from collections import defaultdict
 from collections.abc import Callable, Sequence
-from dataclasses import dataclass, field
 from typing import Any, Optional
 
 import astroid
@@ -31,42 +30,30 @@ _WrapperFuncT = Callable[
 ]
 
 
-# Define typed dataclasses as node extensions, so that astroid nodes can be modified in a type-safe way.
-@dataclass
-class NodeExtension:
-    """Extension for astroid nodes with typed attributes."""
+class ModuleExtension(nodes.Module):
+    """Extended Module with typed attributes."""
 
-    locals_type: defaultdict[str, list[Any]] = field(
-        default_factory=lambda: defaultdict(list)
-    )
-
-
-@dataclass
-class ModuleExtension(NodeExtension):
-    """Extension for astroid.Module nodes."""
-
-    depends: list[str] = field(default_factory=list)
-    type_depends: list[str] = field(default_factory=list)
+    locals_type: defaultdict[str, list[Any]]
+    depends: list[str]
+    type_depends: list[str]
+    uid: int
 
 
-@dataclass
-class ClassExtension(NodeExtension):
-    """Extension for astroid.ClassDef nodes."""
+class ClassDefExtension(nodes.ClassDef):
+    """Extended ClassDef with typed attributes."""
 
-    instance_attrs_type: defaultdict[str, list[Any]] = field(
-        default_factory=lambda: defaultdict(list)
-    )
-    aggregations_type: defaultdict[str, list[Any]] = field(
-        default_factory=lambda: defaultdict(list)
-    )
-    associations_type: defaultdict[str, list[Any]] = field(
-        default_factory=lambda: defaultdict(list)
-    )
+    locals_type: defaultdict[str, list[Any]]
+    instance_attrs_type: defaultdict[str, list[Any]]
+    aggregations_type: defaultdict[str, list[Any]]
+    associations_type: defaultdict[str, list[Any]]
+    uid: int
 
 
-@dataclass
-class FunctionExtension(NodeExtension):
-    """Extension for astroid.FunctionDef nodes."""
+class FunctionDefExtension(nodes.FunctionDef):
+    """Extended FunctionDef with typed attributes."""
+
+    locals_type: defaultdict[str, list[Any]]
+    uid: int
 
 
 def _astroid_wrapper(
@@ -176,7 +163,7 @@ class Linker(IdGeneratorMixIn, utils.LocalsVisitor):
         for module in node.modules:
             self.visit(module)
 
-    def visit_module(self, node: nodes.Module) -> None:
+    def visit_module(self, node: ModuleExtension) -> None:
         """Visit an astroid.Module node.
 
         * set the locals_type mapping
