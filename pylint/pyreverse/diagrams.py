@@ -7,13 +7,16 @@
 from __future__ import annotations
 
 from collections.abc import Iterable
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import astroid
 from astroid import nodes, util
 
 from pylint.checkers.utils import decorated_with_property, in_type_checking_block
 from pylint.pyreverse.utils import FilterMixIn, get_annotation_label
+
+if TYPE_CHECKING:
+    from pylint.pyreverse.inspector import Linker
 
 
 class Figure:
@@ -82,10 +85,11 @@ class ClassDiagram(Figure, FilterMixIn):
 
     TYPE = "class"
 
-    def __init__(self, title: str, mode: str) -> None:
+    def __init__(self, title: str, mode: str, linker: Linker | None = None) -> None:
         FilterMixIn.__init__(self, mode)
         Figure.__init__(self)
         self.title = title
+        self.linker = linker  # Store the linker to access metadata
         # TODO: Specify 'Any' after refactor of `DiagramEntity`
         self.objects: list[Any] = []
         self.relationships: dict[str, list[Relationship]] = {}
@@ -131,11 +135,20 @@ class ClassDiagram(Figure, FilterMixIn):
         }
 
         # Add instance attributes to properties
-        for attr_name, attr_type in list(node.locals_type.items()) + list(
-            node.instance_attrs_type.items()
-        ):
-            if attr_name not in properties:
-                properties[attr_name] = attr_type
+        if self.linker and self.linker.metadata_manager:
+            metadata = self.linker.metadata_manager.get_metadata(node)
+            for attr_name, attr_type in list(metadata.locals_type.items()) + list(
+                metadata.instance_attrs_type.items()
+            ):
+                if attr_name not in properties:
+                    properties[attr_name] = attr_type
+        else:
+            # Fallback to node attributes if no metadata manager available
+            for attr_name, attr_type in list(node.locals_type.items()) + list(
+                node.instance_attrs_type.items()
+            ):
+                if attr_name not in properties:
+                    properties[attr_name] = attr_type
 
         for node_name, associated_nodes in properties.items():
             if not self.show_attr(node_name):
@@ -238,10 +251,24 @@ class ClassDiagram(Figure, FilterMixIn):
             # Track processed attributes to avoid duplicates
             processed_attrs = set()
 
+            # Get metadata from linker if available
+            if self.linker and self.linker.metadata_manager:
+                metadata = self.linker.metadata_manager.get_metadata(node)
+                compositions_type = metadata.compositions_type
+                aggregations_type = metadata.aggregations_type
+                associations_type = metadata.associations_type
+                locals_type = metadata.locals_type
+            else:
+                # Fallback to node attributes
+                compositions_type = getattr(node, "compositions_type", {})
+                aggregations_type = getattr(node, "aggregations_type", {})
+                associations_type = getattr(node, "associations_type", {})
+                locals_type = getattr(node, "locals_type", {})
+
             # Process in priority order: Composition > Aggregation > Association
 
             # 1. Composition links (highest priority)
-            for name, values in list(node.compositions_type.items()):
+            for name, values in list(compositions_type.items()):
                 if not self.show_attr(name):
                     continue
                 for value in values:
@@ -251,7 +278,7 @@ class ClassDiagram(Figure, FilterMixIn):
                     processed_attrs.add(name)
 
             # 2. Aggregation links (medium priority)
-            for name, values in list(node.aggregations_type.items()):
+            for name, values in list(aggregations_type.items()):
                 if not self.show_attr(name) or name in processed_attrs:
                     continue
                 for value in values:
@@ -261,8 +288,8 @@ class ClassDiagram(Figure, FilterMixIn):
                     processed_attrs.add(name)
 
             # 3. Association links (lowest priority)
-            associations = node.associations_type.copy()
-            for name, values in node.locals_type.items():
+            associations = associations_type.copy()
+            for name, values in locals_type.items():
                 if name not in associations:
                     associations[name] = values
 
@@ -332,13 +359,23 @@ class PackageDiagram(ClassDiagram):
         mod_name = node.root().name
         package = self.module(mod_name).node
 
-        if from_module in package.depends:
+        # Get metadata from linker if available
+        if hasattr(self, "linker") and self.linker and self.linker.metadata_manager:
+            metadata = self.linker.metadata_manager.get_metadata(package)
+            depends = metadata.depends
+            type_depends = metadata.type_depends
+        else:
+            # Fallback to node attributes
+            depends = getattr(package, "depends", [])
+            type_depends = getattr(package, "type_depends", [])
+
+        if from_module in depends:
             return
 
         if not in_type_checking_block(node):
-            package.depends.append(from_module)
-        elif from_module not in package.type_depends:
-            package.type_depends.append(from_module)
+            depends.append(from_module)
+        elif from_module not in type_depends:
+            type_depends.append(from_module)
 
     def extract_relationships(self) -> None:
         """Extract relationships between nodes in the diagram."""
@@ -353,14 +390,30 @@ class PackageDiagram(ClassDiagram):
         for package_obj in self.modules():
             package_obj.shape = "package"
             # dependencies
-            for dep_name in package_obj.node.depends:
+            # Get metadata from linker if available
+            if hasattr(self, "linker") and self.linker and self.linker.metadata_manager:
+                metadata = self.linker.metadata_manager.get_metadata(package_obj.node)
+                depends = metadata.depends
+            else:
+                # Fallback to node attributes
+                depends = getattr(package_obj.node, "depends", [])
+
+            for dep_name in depends:
                 try:
                     dep = self.get_module(dep_name, package_obj.node)
                 except KeyError:
                     continue
                 self.add_relationship(package_obj, dep, "depends")
 
-            for dep_name in package_obj.node.type_depends:
+            # Get type_depends from metadata
+            if hasattr(self, "linker") and self.linker and self.linker.metadata_manager:
+                metadata = self.linker.metadata_manager.get_metadata(package_obj.node)
+                type_depends = metadata.type_depends
+            else:
+                # Fallback to node attributes
+                type_depends = getattr(package_obj.node, "type_depends", [])
+
+            for dep_name in type_depends:
                 try:
                     dep = self.get_module(dep_name, package_obj.node)
                 except KeyError:  # pragma: no cover
