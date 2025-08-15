@@ -37,10 +37,27 @@ def project(get_project: GetProjectCallable) -> Generator[Project]:
         yield project
 
 
-def test_locals_assignment_resolution(project: Project) -> None:
+@pytest.fixture
+def project_with_linker(
+    get_project: GetProjectCallable,
+) -> Generator[tuple[Project, inspector.Linker]]:
+    with _test_cwd(TESTS):
+        project = get_project("data", "data")
+        linker = inspector.Linker(project)
+        with warnings.catch_warnings():
+            warnings.filterwarnings("ignore", category=DeprecationWarning)
+            with inspector.PyReverseAnalysisContext(linker):
+                linker.visit(project)
+        yield project, linker
+
+
+def test_locals_assignment_resolution(
+    project_with_linker: tuple[Project, inspector.Linker],
+) -> None:
+    project, linker = project_with_linker
     klass = project.get_module("data.clientmodule_test")["Specialization"]
-    assert hasattr(klass, "locals_type")
-    type_dict = klass.locals_type
+    metadata = linker.metadata_manager.get_metadata(klass)
+    type_dict = metadata.locals_type
     assert len(type_dict) == 2
     keys = sorted(type_dict.keys())
     assert keys == ["TYPE", "top"]
@@ -50,10 +67,13 @@ def test_locals_assignment_resolution(project: Project) -> None:
     assert type_dict["top"][0].value == "class"
 
 
-def test_instance_attrs_resolution(project: Project) -> None:
+def test_instance_attrs_resolution(
+    project_with_linker: tuple[Project, inspector.Linker],
+) -> None:
+    project, linker = project_with_linker
     klass = project.get_module("data.clientmodule_test")["Specialization"]
-    assert hasattr(klass, "instance_attrs_type")
-    type_dict = klass.instance_attrs_type
+    metadata = linker.metadata_manager.get_metadata(klass)
+    type_dict = metadata.instance_attrs_type
     assert len(type_dict) == 3
     keys = sorted(type_dict.keys())
     assert keys == ["_id", "relation", "relation2"]
