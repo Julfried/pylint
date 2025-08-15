@@ -32,7 +32,8 @@ def project(get_project: GetProjectCallable) -> Generator[Project]:
         linker = inspector.Linker(project)
         with warnings.catch_warnings():
             warnings.filterwarnings("ignore", category=DeprecationWarning)
-            linker.visit(project)
+            with inspector.PyReverseAnalysisContext(linker):
+                linker.visit(project)
         yield project
 
 
