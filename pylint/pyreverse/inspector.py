@@ -10,10 +10,14 @@ Try to resolve definitions (namespace) dictionary, relationship...
 from __future__ import annotations
 
 import collections
+import dataclasses
 import os
 import traceback
+import types
 from abc import ABC, abstractmethod
 from collections.abc import Callable, Sequence
+from dataclasses import dataclass, field
+from typing import Any
 
 import astroid
 from astroid import nodes
@@ -22,6 +26,99 @@ from astroid.typing import InferenceResult
 from pylint import constants
 from pylint.checkers.utils import safe_infer
 from pylint.pyreverse import utils
+
+
+@dataclass
+class NodeMetadata:
+    """Metadata for astroid nodes used in pyreverse analysis."""
+
+    locals_type: dict[str, list[Any]] = field(
+        default_factory=lambda: collections.defaultdict(list)
+    )
+    uid: int | None = None
+    # Class-specific attributes (empty for non-class nodes)
+    instance_attrs_type: dict[str, list[Any]] = field(
+        default_factory=lambda: collections.defaultdict(list)
+    )
+    aggregations_type: dict[str, list[Any]] = field(
+        default_factory=lambda: collections.defaultdict(list)
+    )
+    associations_type: dict[str, list[Any]] = field(
+        default_factory=lambda: collections.defaultdict(list)
+    )
+    compositions_type: dict[str, list[Any]] = field(
+        default_factory=lambda: collections.defaultdict(list)
+    )
+    specializations: list[Any] = field(default_factory=list)
+    # Module-specific attributes (empty for non-module nodes)
+    depends: list[str] = field(default_factory=list)
+    type_depends: list[str] = field(default_factory=list)
+
+
+@dataclass
+class ModuleMetadata(NodeMetadata):
+    """Metadata for astroid.Module nodes."""
+
+
+@dataclass
+class ClassMetadata(NodeMetadata):
+    """Metadata for astroid.ClassDef nodes."""
+
+
+class NodeMetadataManager:
+    """Manages metadata for astroid nodes in pyreverse analysis."""
+
+    def __init__(self) -> None:
+        self.node_metadata: dict[nodes.NodeNG, NodeMetadata] = {}
+
+    def get_metadata(self, node: nodes.NodeNG) -> NodeMetadata:
+        """Get or create metadata for the given node."""
+        if node not in self.node_metadata:
+            if isinstance(node, nodes.Module):
+                self.node_metadata[node] = ModuleMetadata()
+            elif isinstance(node, nodes.ClassDef):
+                self.node_metadata[node] = ClassMetadata()
+            else:
+                self.node_metadata[node] = NodeMetadata()
+        return self.node_metadata[node]
+
+    def has_metadata(self, node: nodes.NodeNG) -> bool:
+        """Check if metadata exists for the given node."""
+        return node in self.node_metadata
+
+    def apply_to_all_nodes(self) -> None:
+        """Apply metadata as attributes to all nodes for backward compatibility."""
+        for node, metadata in self.node_metadata.items():
+            # Manually copy fields instead of using dataclasses.asdict() to avoid deep copy issues
+            for field_def in dataclasses.fields(metadata):
+                field_value = getattr(metadata, field_def.name)
+                setattr(node, field_def.name, field_value)
+
+
+class PyReverseAnalysisContext:
+    """Context manager for pyreverse analysis with metadata management."""
+
+    def __init__(self, linker: Linker) -> None:
+        self.linker = linker
+        self.metadata_manager = NodeMetadataManager()
+        self.original_metadata_manager = getattr(linker, "metadata_manager", None)
+
+    def __enter__(self) -> NodeMetadataManager:
+        self.linker.metadata_manager = self.metadata_manager
+        return self.metadata_manager  # Return the manager for direct access
+
+    def __exit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc_val: BaseException | None,
+        exc_tb: types.TracebackType | None,
+    ) -> None:
+        # Apply metadata to nodes for backward compatibility with diagrams
+        self.metadata_manager.apply_to_all_nodes()
+        # Restore original metadata manager if it existed
+        if self.original_metadata_manager:
+            self.linker.metadata_manager = self.original_metadata_manager
+
 
 _WrapperFuncT = Callable[
     [Callable[[str], nodes.Module], str, bool], nodes.Module | None
@@ -125,14 +222,28 @@ class Linker(IdGeneratorMixIn, utils.LocalsVisitor):
         self.tag = tag
         # visited project
         self.project = project
+        # This will be injected by the context manager
+        self.metadata_manager: NodeMetadataManager | None = None
 
         # Chain: Composition → Aggregation → Association
-        self.compositions_handler = CompositionsHandler()
-        aggregation_handler = AggregationsHandler()
-        association_handler = AssociationsHandler()
+        self.compositions_handler = CompositionsHandler(self)
+        aggregation_handler = AggregationsHandler(self)
+        association_handler = AssociationsHandler(self)
 
         self.compositions_handler.set_next(aggregation_handler)
         aggregation_handler.set_next(association_handler)
+
+    def get_metadata(self, node: nodes.NodeNG) -> NodeMetadata:
+        """Get or create metadata for the given node."""
+        if not self.metadata_manager:
+            raise RuntimeError("Linker must be used within PyReverseAnalysisContext")
+        return self.metadata_manager.get_metadata(node)
+
+    def has_metadata(self, node: nodes.NodeNG) -> bool:
+        """Check if metadata exists for the given node."""
+        if not self.metadata_manager:
+            raise RuntimeError("Linker must be used within PyReverseAnalysisContext")
+        return self.metadata_manager.has_metadata(node)
 
     def visit_project(self, node: Project) -> None:
         """Visit a pyreverse.utils.Project node.
@@ -143,6 +254,7 @@ class Linker(IdGeneratorMixIn, utils.LocalsVisitor):
             node.uid = self.generate_id()
         for module in node.modules:
             self.visit(module)
+        # No need to manually apply metadata - context manager handles it
 
     def visit_module(self, node: nodes.Module) -> None:
         """Visit an astroid.Module node.
@@ -151,13 +263,12 @@ class Linker(IdGeneratorMixIn, utils.LocalsVisitor):
         * set the depends mapping
         * optionally tag the node with a unique id
         """
-        if hasattr(node, "locals_type"):
+        if hasattr(node, "_pyreverse_visited"):
             return
-        node.locals_type = collections.defaultdict(list)
-        node.depends = []
-        node.type_depends = []
+        metadata = self.get_metadata(node)
         if self.tag:
-            node.uid = self.generate_id()
+            metadata.uid = self.generate_id()
+        node._pyreverse_visited = True
 
     def visit_classdef(self, node: nodes.ClassDef) -> None:
         """Visit an astroid.Class node.
@@ -165,21 +276,16 @@ class Linker(IdGeneratorMixIn, utils.LocalsVisitor):
         * set the locals_type and instance_attrs_type mappings
         * optionally tag the node with a unique id
         """
-        if hasattr(node, "locals_type"):
+        if hasattr(node, "_pyreverse_visited"):
             return
-        node.locals_type = collections.defaultdict(list)
+        metadata = self.get_metadata(node)
         if self.tag:
-            node.uid = self.generate_id()
+            metadata.uid = self.generate_id()
         # resolve ancestors
         for baseobj in node.ancestors(recurs=False):
-            specializations = getattr(baseobj, "specializations", [])
-            specializations.append(node)
-            baseobj.specializations = specializations
+            base_metadata = self.get_metadata(baseobj)
+            base_metadata.specializations.append(node)
         # resolve instance attributes
-        node.compositions_type = collections.defaultdict(list)
-        node.instance_attrs_type = collections.defaultdict(list)
-        node.aggregations_type = collections.defaultdict(list)
-        node.associations_type = collections.defaultdict(list)
         for assignattrs in tuple(node.instance_attrs.values()):
             for assignattr in assignattrs:
                 if not isinstance(assignattr, nodes.Unknown):
@@ -194,17 +300,20 @@ class Linker(IdGeneratorMixIn, utils.LocalsVisitor):
                 ):
                     self.compositions_handler.handle(local_node, node)
 
+        node._pyreverse_visited = True
+
     def visit_functiondef(self, node: nodes.FunctionDef) -> None:
         """Visit an astroid.Function node.
 
         * set the locals_type mapping
         * optionally tag the node with a unique id
         """
-        if hasattr(node, "locals_type"):
+        if hasattr(node, "_pyreverse_visited"):
             return
-        node.locals_type = collections.defaultdict(list)
+        metadata = self.get_metadata(node)
         if self.tag:
-            node.uid = self.generate_id()
+            metadata.uid = self.generate_id()
+        node._pyreverse_visited = True
 
     def visit_assignname(self, node: nodes.AssignName) -> None:
         """Visit an astroid.AssignName node.
@@ -222,8 +331,8 @@ class Linker(IdGeneratorMixIn, utils.LocalsVisitor):
             # the name has been defined as 'global' in the frame and belongs
             # there.
             frame = node.root()
-        if not hasattr(frame, "locals_type"):
-            # If the frame doesn't have a locals_type yet,
+        if not self.has_metadata(frame):
+            # If the frame doesn't have metadata yet,
             # it means it wasn't yet visited. Visit it now
             # to add what's missing from it.
             if isinstance(frame, nodes.ClassDef):
@@ -233,17 +342,22 @@ class Linker(IdGeneratorMixIn, utils.LocalsVisitor):
             else:
                 self.visit_module(frame)
 
-        current = frame.locals_type[node.name]
-        frame.locals_type[node.name] = list(set(current) | utils.infer_node(node))
+        frame_metadata = self.get_metadata(frame)
+        current = frame_metadata.locals_type[node.name]
+        frame_metadata.locals_type[node.name] = list(
+            set(current) | utils.infer_node(node)
+        )
 
-    @staticmethod
-    def handle_assignattr_type(node: nodes.AssignAttr, parent: nodes.ClassDef) -> None:
+    def handle_assignattr_type(
+        self, node: nodes.AssignAttr, parent: nodes.ClassDef
+    ) -> None:
         """Handle an astroid.assignattr node.
 
         handle instance_attrs_type
         """
-        current = set(parent.instance_attrs_type[node.attrname])
-        parent.instance_attrs_type[node.attrname] = list(
+        parent_metadata = self.get_metadata(parent)
+        current = set(parent_metadata.instance_attrs_type[node.attrname])
+        parent_metadata.instance_attrs_type[node.attrname] = list(
             current | utils.infer_node(node)
         )
 
@@ -300,11 +414,9 @@ class Linker(IdGeneratorMixIn, utils.LocalsVisitor):
             mod_path = f"{'.'.join(context_name.split('.')[:-1])}.{mod_path}"
         if self.compute_module(context_name, mod_path):
             # handle dependencies
-            if not hasattr(module, "depends"):
-                module.depends = []
-            mod_paths = module.depends
-            if mod_path not in mod_paths:
-                mod_paths.append(mod_path)
+            module_metadata = self.get_metadata(module)
+            if mod_path not in module_metadata.depends:
+                module_metadata.depends.append(mod_path)
 
 
 class RelationshipHandlerInterface(ABC):
@@ -334,6 +446,9 @@ class AbstractRelationshipHandler(RelationshipHandlerInterface):
     """
 
     _next_handler: RelationshipHandlerInterface
+
+    def __init__(self, linker: Linker) -> None:
+        self.linker = linker
 
     def set_next(
         self, handler: RelationshipHandlerInterface
@@ -373,8 +488,9 @@ class CompositionsHandler(AbstractRelationshipHandler):
             # Resolve nodes to actual class definitions
             resolved_types = resolve_to_class_def(element_types)
 
-            current = set(parent.compositions_type[name])
-            parent.compositions_type[name] = list(current | resolved_types)
+            parent_metadata = self.linker.get_metadata(parent)
+            current = set(parent_metadata.compositions_type[name])
+            parent_metadata.compositions_type[name] = list(current | resolved_types)
             return
 
         # Composition: comprehensions with object creation (self.x = [P() for ...])
@@ -394,8 +510,9 @@ class CompositionsHandler(AbstractRelationshipHandler):
                 # Resolve nodes to actual class definitions
                 resolved_types = resolve_to_class_def(element_types)
 
-                current = set(parent.compositions_type[name])
-                parent.compositions_type[name] = list(current | resolved_types)
+                parent_metadata = self.linker.get_metadata(parent)
+                current = set(parent_metadata.compositions_type[name])
+                parent_metadata.compositions_type[name] = list(current | resolved_types)
                 return
 
         # Not a composition, pass to next handler
@@ -426,8 +543,9 @@ class AggregationsHandler(AbstractRelationshipHandler):
             # Resolve nodes to actual class definitions
             resolved_types = resolve_to_class_def(element_types)
 
-            current = set(parent.aggregations_type[name])
-            parent.aggregations_type[name] = list(current | resolved_types)
+            parent_metadata = self.linker.get_metadata(parent)
+            current = set(parent_metadata.aggregations_type[name])
+            parent_metadata.aggregations_type[name] = list(current | resolved_types)
             return
 
         # Aggregation: comprehensions without object creation (self.x = [existing_obj for ...])
@@ -447,8 +565,9 @@ class AggregationsHandler(AbstractRelationshipHandler):
                 # Resolve nodes to actual class definitions
                 resolved_types = resolve_to_class_def(element_types)
 
-                current = set(parent.aggregations_type[name])
-                parent.aggregations_type[name] = list(current | resolved_types)
+                parent_metadata = self.linker.get_metadata(parent)
+                current = set(parent_metadata.aggregations_type[name])
+                parent_metadata.aggregations_type[name] = list(current | resolved_types)
                 return
 
         # Not an aggregation, pass to next handler
@@ -473,24 +592,26 @@ class AssociationsHandler(AbstractRelationshipHandler):
             # Resolve nodes to actual class definitions
             resolved_types = resolve_to_class_def(element_types)
 
-            current = set(parent.associations_type[name])
-            parent.associations_type[name] = list(current | resolved_types)
+            parent_metadata = self.linker.get_metadata(parent)
+            current = set(parent_metadata.associations_type[name])
+            parent_metadata.associations_type[name] = list(current | resolved_types)
             return
 
         # Everything else is also association (fallback)
-        current = set(parent.associations_type[name])
+        parent_metadata = self.linker.get_metadata(parent)
+        current = set(parent_metadata.associations_type[name])
         inferred_types = utils.infer_node(node)
         element_types = extract_element_types(inferred_types)
 
         # Resolve Name nodes to actual class definitions
         resolved_types = resolve_to_class_def(element_types)
-        parent.associations_type[name] = list(current | resolved_types)
+        parent_metadata.associations_type[name] = list(current | resolved_types)
 
 
-def resolve_to_class_def(types: set[nodes.NodeNG]) -> set[nodes.ClassDef]:
+def resolve_to_class_def(node_types: set[nodes.NodeNG]) -> set[nodes.ClassDef]:
     """Resolve a set of nodes to ClassDef nodes."""
     class_defs = set()
-    for node in types:
+    for node in node_types:
         if isinstance(node, nodes.ClassDef):
             class_defs.add(node)
         elif isinstance(node, nodes.Name):
