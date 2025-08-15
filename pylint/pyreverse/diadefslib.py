@@ -16,7 +16,7 @@ from astroid import nodes
 from astroid.modutils import is_stdlib_module
 
 from pylint.pyreverse.diagrams import ClassDiagram, PackageDiagram
-from pylint.pyreverse.inspector import Linker, Project
+from pylint.pyreverse.inspector import Linker, Project, PyReverseAnalysisContext
 from pylint.pyreverse.utils import LocalsVisitor
 
 # diagram generators ##########################################################
@@ -139,7 +139,8 @@ class DiaDefGenerator:
 
     def add_class(self, node: nodes.ClassDef) -> None:
         """Visit one class and add it to diagram."""
-        self.linker.visit(node)
+        with PyReverseAnalysisContext(self.linker):
+            self.linker.visit(node)
         self.classdiagram.add_object(self.get_title(node), node)
 
     def get_ancestors(
@@ -224,7 +225,8 @@ class DefaultDiadefGenerator(LocalsVisitor, DiaDefGenerator):
         add this class to the package diagram definition
         """
         if self.pkgdiagram and self._should_include_by_depth(node):
-            self.linker.visit(node)
+            with PyReverseAnalysisContext(self.linker):
+                self.linker.visit(node)
             self.pkgdiagram.add_object(node.name, node)
 
     def visit_classdef(self, node: nodes.ClassDef) -> None:
