@@ -10,7 +10,6 @@ Try to resolve definitions (namespace) dictionary, relationship...
 from __future__ import annotations
 
 import collections
-import dataclasses
 import os
 import traceback
 import types
@@ -70,6 +69,7 @@ class NodeMetadataManager:
 
     def __init__(self) -> None:
         self.node_metadata: dict[nodes.NodeNG, NodeMetadata] = {}
+        self.visited_nodes: set[nodes.NodeNG] = set()
 
     def get_metadata(self, node: nodes.NodeNG) -> NodeMetadata:
         """Get or create metadata for the given node."""
@@ -86,13 +86,13 @@ class NodeMetadataManager:
         """Check if metadata exists for the given node."""
         return node in self.node_metadata
 
-    def apply_to_all_nodes(self) -> None:
-        """Apply metadata as attributes to all nodes for backward compatibility."""
-        for node, metadata in self.node_metadata.items():
-            # Manually copy fields instead of using dataclasses.asdict() to avoid deep copy issues
-            for field_def in dataclasses.fields(metadata):
-                field_value = getattr(metadata, field_def.name)
-                setattr(node, field_def.name, field_value)
+    def is_visited(self, node: nodes.NodeNG) -> bool:
+        """Check if a node has been visited."""
+        return node in self.visited_nodes
+
+    def mark_visited(self, node: nodes.NodeNG) -> None:
+        """Mark a node as visited."""
+        self.visited_nodes.add(node)
 
 
 class PyReverseAnalysisContext:
@@ -100,12 +100,9 @@ class PyReverseAnalysisContext:
 
     def __init__(self, linker: Linker) -> None:
         self.linker = linker
-        self.metadata_manager = NodeMetadataManager()
-        self.original_metadata_manager = getattr(linker, "metadata_manager", None)
 
     def __enter__(self) -> NodeMetadataManager:
-        self.linker.metadata_manager = self.metadata_manager
-        return self.metadata_manager  # Return the manager for direct access
+        return self.linker.metadata_manager
 
     def __exit__(
         self,
@@ -113,11 +110,8 @@ class PyReverseAnalysisContext:
         exc_val: BaseException | None,
         exc_tb: types.TracebackType | None,
     ) -> None:
-        # Apply metadata to nodes for backward compatibility with diagrams
-        self.metadata_manager.apply_to_all_nodes()
-        # Restore original metadata manager if it existed
-        if self.original_metadata_manager:
-            self.linker.metadata_manager = self.original_metadata_manager
+        # No need to apply metadata to nodes anymore!
+        pass
 
 
 _WrapperFuncT = Callable[
@@ -222,8 +216,8 @@ class Linker(IdGeneratorMixIn, utils.LocalsVisitor):
         self.tag = tag
         # visited project
         self.project = project
-        # This will be injected by the context manager
-        self.metadata_manager: NodeMetadataManager | None = None
+        # Always have a metadata manager available
+        self.metadata_manager = NodeMetadataManager()
 
         # Chain: Composition → Aggregation → Association
         self.compositions_handler = CompositionsHandler(self)
@@ -235,14 +229,10 @@ class Linker(IdGeneratorMixIn, utils.LocalsVisitor):
 
     def get_metadata(self, node: nodes.NodeNG) -> NodeMetadata:
         """Get or create metadata for the given node."""
-        if not self.metadata_manager:
-            raise RuntimeError("Linker must be used within PyReverseAnalysisContext")
         return self.metadata_manager.get_metadata(node)
 
     def has_metadata(self, node: nodes.NodeNG) -> bool:
         """Check if metadata exists for the given node."""
-        if not self.metadata_manager:
-            raise RuntimeError("Linker must be used within PyReverseAnalysisContext")
         return self.metadata_manager.has_metadata(node)
 
     def visit_project(self, node: Project) -> None:
@@ -263,12 +253,15 @@ class Linker(IdGeneratorMixIn, utils.LocalsVisitor):
         * set the depends mapping
         * optionally tag the node with a unique id
         """
-        if hasattr(node, "_pyreverse_visited"):
+        if self.metadata_manager.is_visited(node):
             return
         metadata = self.get_metadata(node)
         if self.tag:
             metadata.uid = self.generate_id()
-        node._pyreverse_visited = True
+        self.metadata_manager.mark_visited(node)
+        # Visit all child nodes to process imports and other constructs
+        for child in node.get_children():
+            self.visit(child)
 
     def visit_classdef(self, node: nodes.ClassDef) -> None:
         """Visit an astroid.Class node.
@@ -276,7 +269,7 @@ class Linker(IdGeneratorMixIn, utils.LocalsVisitor):
         * set the locals_type and instance_attrs_type mappings
         * optionally tag the node with a unique id
         """
-        if hasattr(node, "_pyreverse_visited"):
+        if self.metadata_manager.is_visited(node):
             return
         metadata = self.get_metadata(node)
         if self.tag:
@@ -300,7 +293,7 @@ class Linker(IdGeneratorMixIn, utils.LocalsVisitor):
                 ):
                     self.compositions_handler.handle(local_node, node)
 
-        node._pyreverse_visited = True
+        self.metadata_manager.mark_visited(node)
 
     def visit_functiondef(self, node: nodes.FunctionDef) -> None:
         """Visit an astroid.Function node.
@@ -308,12 +301,12 @@ class Linker(IdGeneratorMixIn, utils.LocalsVisitor):
         * set the locals_type mapping
         * optionally tag the node with a unique id
         """
-        if hasattr(node, "_pyreverse_visited"):
+        if self.metadata_manager.is_visited(node):
             return
         metadata = self.get_metadata(node)
         if self.tag:
             metadata.uid = self.generate_id()
-        node._pyreverse_visited = True
+        self.metadata_manager.mark_visited(node)
 
     def visit_assignname(self, node: nodes.AssignName) -> None:
         """Visit an astroid.AssignName node.
@@ -322,9 +315,11 @@ class Linker(IdGeneratorMixIn, utils.LocalsVisitor):
         """
         # avoid double parsing done by different Linkers.visit
         # running over the same project:
-        if hasattr(node, "_handled"):
+        # Use a different visited set for assignname nodes to avoid conflicts
+        handled_key = f"_handled_{id(self)}"
+        if hasattr(node, handled_key):
             return
-        node._handled = True
+        setattr(node, handled_key, True)
         if node.name in node.frame():
             frame = node.frame()
         else:
@@ -382,18 +377,9 @@ class Linker(IdGeneratorMixIn, utils.LocalsVisitor):
             relative = astroid.modutils.is_relative(basename, context_file)
         else:
             relative = False
-        for name in node.names:
-            if name[0] == "*":
-                continue
-            # analyze dependencies
-            fullname = f"{basename}.{name[0]}"
-            if fullname.find(".") > -1:
-                try:
-                    fullname = astroid.modutils.get_module_part(fullname, context_file)
-                except ImportError:
-                    continue
-            if fullname != basename:
-                self._imported_module(node, fullname, relative)
+
+        # For 'from module import name' we want to record dependency on module
+        self._imported_module(node, basename, relative)
 
     def compute_module(self, context_name: str, mod_path: str) -> bool:
         """Should the module be added to dependencies ?"""
